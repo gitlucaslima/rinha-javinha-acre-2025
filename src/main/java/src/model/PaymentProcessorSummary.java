@@ -10,4 +10,9 @@ public class PaymentProcessorSummary {
         this.totalRequests = totalRequests;
         this.totalAmount = totalAmount;
     }
+
+    @Override
+    public String toString() {
+        return "PaymentProcessorSummary [totalRequests=" + totalRequests + ", totalAmount=" + totalAmount + "]";
+    }
 }

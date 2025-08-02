@@ -21,70 +21,82 @@ public class SimplePaymentProcessor {
 
     private static volatile PaymentRequest successfulPaymentForTest = null;
     private static volatile boolean defaultProcessorHealthy = true;
-    private static final int WORKER_POOL_SIZE = Runtime.getRuntime().availableProcessors();
-    private static final ExecutorService workerExecutor = Executors.newFixedThreadPool(WORKER_POOL_SIZE);
-    private static final ScheduledExecutorService healthCheckExecutor = Executors.newScheduledThreadPool(4);
 
-    // Enfileira pagamento vindo do endpoint
+    // Configuração dinâmica baseada no hardware
+    private static final int AVAILABLE_CORES = Runtime.getRuntime().availableProcessors();
+    private static final int WORKER_POOL_SIZE = Math.max(8, AVAILABLE_CORES * 2); 
+    private static final int HEALTH_CHECK_THREADS = Math.max(2, AVAILABLE_CORES / 4);
+
+    private static final ExecutorService workerExecutor = Executors.newFixedThreadPool(WORKER_POOL_SIZE);
+    private static final ScheduledExecutorService healthCheckExecutor = Executors
+            .newScheduledThreadPool(HEALTH_CHECK_THREADS);
+
     public static void enqueuePayment(PaymentRequest req) {
         paymentQueue.offer(req);
     }
 
     public static void startPaymentWorker() {
-        for (int i = 0; i < WORKER_POOL_SIZE; i++) {
-            workerExecutor.submit(() -> {
-                while (true) {
-                    try {
-                        PaymentRequest payment = paymentQueue.take();
-    
-                        boolean exists = RedisAsyncManager.existsAsync(payment.correlationId)
-                            .get(2, TimeUnit.SECONDS);
-    
-                        if (exists) {
-                            continue; // já processado, pega próximo
-                        }
-    
-                        if (!defaultProcessorHealthy) {
-                            paymentQueue.offer(payment);
-                            Thread.sleep(50);
-                            continue;
-                        }
-    
-                        boolean success = PaymentService.sendPaymentToProcessor(payment, DEFAULT_PROCESSOR);
-    
-                        if (success) {
-                            RedisAsyncManager.incrementTotalRequests().get(1, TimeUnit.SECONDS);
-                            RedisAsyncManager.incrementTotalAmount(new BigDecimal(payment.amount)).get(1, TimeUnit.SECONDS);
-                            RedisAsyncManager.createRedisRequest(payment.requestedAt, payment.correlationId, payment.amount).get(1, TimeUnit.SECONDS);
-    
-                            if (successfulPaymentForTest == null) {
-                                successfulPaymentForTest = payment;
-                            }
-                        } else {
-                            defaultProcessorHealthy = false;
-                            paymentQueue.offer(payment);
-                            Thread.sleep(50);
-                        }
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                        // Em caso de erro, opcional: esperar um pouco antes de continuar para evitar loop rápido
-                        try {
-                            Thread.sleep(100);
-                        } catch (InterruptedException ignored) {}
-                    }
+        java.util.stream.IntStream.range(0, WORKER_POOL_SIZE)
+                .parallel() // Cria workers em paralelo
+                .forEach(i -> workerExecutor.submit(SimplePaymentProcessor::processPayments));
+    }
+
+    private static void processPayments() {
+        while (true) {
+            try {
+                PaymentRequest payment = paymentQueue.take();
+
+                if (!defaultProcessorHealthy) {
+                    paymentQueue.offer(payment);
+                    continue;
                 }
-            });
+
+                RedisAsyncManager.existsAsync(payment.correlationId)
+                        .whenComplete((exists, throwable) -> {
+                            if (throwable != null || exists) {
+                                return;
+                            }
+
+                            processPaymentAsync(payment);
+                        });
+
+            } catch (Exception ignored) {
+            }
         }
     }
-    
+
+    private static void processPaymentAsync(PaymentRequest payment) {
+        java.util.concurrent.CompletableFuture
+                .supplyAsync(() -> PaymentService.sendPaymentToProcessor(payment, DEFAULT_PROCESSOR))
+                .whenComplete((success, throwable) -> {
+                    if (throwable != null) {
+                        defaultProcessorHealthy = false;
+                        paymentQueue.offer(payment);
+                        return;
+                    }
+
+                    if (success) {
+                        RedisAsyncManager.incrementTotalRequests();
+                        RedisAsyncManager.incrementTotalAmount(new BigDecimal(payment.amount));
+                        RedisAsyncManager.createRedisRequest(payment.requestedAt, payment.correlationId,
+                                payment.amount);
+
+                        if (successfulPaymentForTest == null) {
+                            successfulPaymentForTest = payment;
+                        }
+                    } else {
+                        defaultProcessorHealthy = false;
+                        paymentQueue.offer(payment);
+                    }
+                });
+    }
+
     public static void startHealthCheckMonitoring() {
         healthCheckExecutor.scheduleWithFixedDelay(() -> {
             if (successfulPaymentForTest != null && !defaultProcessorHealthy) {
-                boolean healthy = HealthCheckService.checkDefaultProcessorHealth(DEFAULT_PROCESSOR,
+                defaultProcessorHealthy = HealthCheckService.checkDefaultProcessorHealth(DEFAULT_PROCESSOR,
                         successfulPaymentForTest);
-                if (healthy)
-                    defaultProcessorHealthy = true;
             }
-        }, 100, 10, TimeUnit.MILLISECONDS);
+        }, 100, 200, TimeUnit.MILLISECONDS);
     }
 }

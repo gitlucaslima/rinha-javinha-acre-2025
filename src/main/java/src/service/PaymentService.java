@@ -9,7 +9,7 @@ import src.model.PaymentRequest;
 
 public class PaymentService {
     private static final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(2))
+            .connectTimeout(Duration.ofMillis(500))  // ❌ Era 2s
             .build();
 
     public static boolean sendPaymentToProcessor(PaymentRequest payment, String processorUrl) {
@@ -20,7 +20,7 @@ public class PaymentService {
             );
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(processorUrl + "/payments"))
-                    .timeout(Duration.ofSeconds(1))
+                    .timeout(Duration.ofMillis(200))  // ❌ Era 300ms
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
                     .build();

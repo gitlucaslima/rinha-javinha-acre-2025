@@ -21,7 +21,7 @@ public class HealthCheckService {
             );
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(processorUrl + "/payments"))
-                    .timeout(Duration.ofSeconds(1))
+                    .timeout(Duration.ofMillis(200))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
                     .build();
