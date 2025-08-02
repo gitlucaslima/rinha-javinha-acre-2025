@@ -22,10 +22,10 @@ services:
           memory: "50MB"
 
   app:
-    image: rinha-backend-2025
+    image: gitlucaslima/rinha-backend-2025:latest
     environment:
       - REDIS_URI=redis://rinha-redis:6379
-      - DEFAULT_PROCESSOR_URL=http://processador-docker:8001
+      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
     depends_on:
       - redis
     networks:
@@ -38,10 +38,10 @@ services:
           memory: "125MB"
 
   app2:
-    image: rinha-backend-2025
+    image: gitlucaslima/rinha-backend-2025:latest
     environment:
       - REDIS_URI=redis://rinha-redis:6379
-      - DEFAULT_PROCESSOR_URL=http://processador-docker:8001
+      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
     depends_on:
       - redis
     networks:
@@ -70,9 +70,6 @@ services:
         limits:
           cpus: "0.15"
           memory: "50MB"
-
-# volumes:
-#   redis_data:
 
 networks:
   backend:
