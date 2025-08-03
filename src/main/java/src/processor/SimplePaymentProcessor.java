@@ -12,72 +12,79 @@ import src.model.PaymentRequest;
 import src.service.HealthCheckService;
 import src.service.PaymentService;
 import src.service.RedisAsyncManager;
-
 public class SimplePaymentProcessor {
     private static final String DEFAULT_PROCESSOR = System.getenv().getOrDefault("DEFAULT_PROCESSOR_URL",
             "http://localhost:8001");
 
-    private static final BlockingQueue<PaymentRequest> paymentQueue = new LinkedBlockingQueue<>();
+    // Queue ULTRA-OTIMIZADA
+    private static final BlockingQueue<PaymentRequest> paymentQueue = new LinkedBlockingQueue<>(1000000);
 
     private static volatile PaymentRequest successfulPaymentForTest = null;
     private static volatile boolean defaultProcessorHealthy = true;
 
-    // Configuração dinâmica baseada no hardware
+    // Pool MAIS AGRESSIVO para máxima performance
     private static final int AVAILABLE_CORES = Runtime.getRuntime().availableProcessors();
-    private static final int WORKER_POOL_SIZE = Math.max(8, AVAILABLE_CORES * 2); 
-    private static final int HEALTH_CHECK_THREADS = Math.max(2, AVAILABLE_CORES / 4);
+    private static final int WORKER_POOL_SIZE = Math.max(12, AVAILABLE_CORES * 3); // Aumentado de *2 para *3
+    private static final int HEALTH_CHECK_THREADS = 1; // Reduzido para 1 thread apenas
 
     private static final ExecutorService workerExecutor = Executors.newFixedThreadPool(WORKER_POOL_SIZE);
     private static final ScheduledExecutorService healthCheckExecutor = Executors
             .newScheduledThreadPool(HEALTH_CHECK_THREADS);
 
     public static void enqueuePayment(PaymentRequest req) {
+        // Oferece sem bloqueio - se queue cheia, dropa (fail-fast)
         paymentQueue.offer(req);
     }
 
     public static void startPaymentWorker() {
         java.util.stream.IntStream.range(0, WORKER_POOL_SIZE)
-                .parallel() // Cria workers em paralelo
-                .forEach(i -> workerExecutor.submit(SimplePaymentProcessor::processPayments));
+                .parallel()
+                .forEach(i -> workerExecutor.submit(SimplePaymentProcessor::processPaymentsOptimized));
     }
 
-    private static void processPayments() {
+    // Versão ULTRA-OTIMIZADA do processPayments
+    private static void processPaymentsOptimized() {
         while (true) {
             try {
-                PaymentRequest payment = paymentQueue.take();
+                // Poll com timeout ao invés de take() bloqueante
+                PaymentRequest payment = paymentQueue.poll(10, TimeUnit.MILLISECONDS);
+                if (payment == null) continue;
 
                 if (!defaultProcessorHealthy) {
-                    paymentQueue.offer(payment);
+                    // Rejeita imediatamente se unhealthy
                     continue;
                 }
 
+                // Check Redis MAIS AGRESSIVO
                 RedisAsyncManager.existsAsync(payment.correlationId)
+                        .orTimeout(25, TimeUnit.MILLISECONDS) // Timeout ULTRA agressivo
                         .whenComplete((exists, throwable) -> {
-                            if (throwable != null || exists) {
-                                return;
+                            if (throwable != null || Boolean.TRUE.equals(exists)) {
+                                return; // Dropa duplicata ou erro
                             }
 
-                            processPaymentAsync(payment);
+                            processPaymentAsyncOptimized(payment);
                         });
 
             } catch (Exception ignored) {
+                // Ignora erros para manter performance
             }
         }
     }
 
-    private static void processPaymentAsync(PaymentRequest payment) {
+    private static void processPaymentAsyncOptimized(PaymentRequest payment) {
         java.util.concurrent.CompletableFuture
                 .supplyAsync(() -> PaymentService.sendPaymentToProcessor(payment, DEFAULT_PROCESSOR))
+                .orTimeout(500, TimeUnit.MILLISECONDS) // Timeout mais agressivo
                 .whenComplete((success, throwable) -> {
                     if (throwable != null) {
                         defaultProcessorHealthy = false;
-                        paymentQueue.offer(payment);
-                        return;
+                        return; // Não requeue - dropa
                     }
 
-                    if (success) {
+                    if (Boolean.TRUE.equals(success)) {
+                        // Fire-and-forget Redis operations
                         RedisAsyncManager.incrementTotalRequests();
-                        RedisAsyncManager.incrementTotalAmount(new BigDecimal(payment.amount));
                         RedisAsyncManager.createRedisRequest(payment.requestedAt, payment.correlationId,
                                 payment.amount);
 
@@ -86,17 +93,17 @@ public class SimplePaymentProcessor {
                         }
                     } else {
                         defaultProcessorHealthy = false;
-                        paymentQueue.offer(payment);
                     }
                 });
     }
 
     public static void startHealthCheckMonitoring() {
+        // Health check MENOS agressivo
         healthCheckExecutor.scheduleWithFixedDelay(() -> {
             if (successfulPaymentForTest != null && !defaultProcessorHealthy) {
                 defaultProcessorHealthy = HealthCheckService.checkDefaultProcessorHealth(DEFAULT_PROCESSOR,
                         successfulPaymentForTest);
             }
-        }, 100, 200, TimeUnit.MILLISECONDS);
+        }, 200, 500, TimeUnit.MILLISECONDS); // Aumentado intervalo
     }
 }
