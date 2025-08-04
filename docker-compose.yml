@@ -22,7 +22,7 @@ services:
           memory: "50MB"
 
   app:
-    image: gitlucaslima/rinha-backend-2025:0.1
+    image: gitlucaslima/rinha-backend-2025:0.2
     environment:
       - REDIS_URI=redis://rinha-redis:6379
       - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
@@ -38,7 +38,7 @@ services:
           memory: "125MB"
 
   app2:
-    image: gitlucaslima/rinha-backend-2025:0.1
+    image: gitlucaslima/rinha-backend-2025:0.2
     environment:
       - REDIS_URI=redis://rinha-redis:6379
       - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
