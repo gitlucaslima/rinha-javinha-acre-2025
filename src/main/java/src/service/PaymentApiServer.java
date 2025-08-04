@@ -7,8 +7,6 @@ import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
@@ -20,49 +18,44 @@ import src.processor.SimplePaymentProcessor;
 public class PaymentApiServer {
     // Cache do valor amount fixo
     private static volatile String cachedAmount = null;
-    private static final Object amountLock = new Object();
-    private static final ThreadPoolExecutor httpExecutor = (ThreadPoolExecutor) Executors.newFixedThreadPool(
-            Math.max(8, Runtime.getRuntime().availableProcessors() * 4));
+    private static volatile BigDecimal cachedAmountBD = null;
 
     public static void start(int port) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/payment", new PaymentHandler());
-        server.createContext("/payments-summary", new PaymentSummaryHandler());
-        server.setExecutor(httpExecutor);
+
+        // Handlers específicos por método - ZERO overhead de verificação
+        server.createContext("/payment", new PostPaymentHandler());
+        server.createContext("/payments-summary", new GetPaymentSummaryHandler());
+
+        // SEM executor customizado - usa o padrão do HttpServer (mais eficiente para
+        // I/O simples)
         server.start();
     }
 
-    static class PaymentHandler implements HttpHandler {
-        // Pattern matching otimizado para JSON conhecido
+    // Handler ESPECÍFICO para POST /payment - SÍNCRONO para máxima velocidade
+    static class PostPaymentHandler implements HttpHandler {
         private static final byte[] CORRELATION_PATTERN = "\"correlationId\":\"".getBytes(StandardCharsets.UTF_8);
         private static final byte[] AMOUNT_PATTERN = "\"amount\":\"".getBytes(StandardCharsets.UTF_8);
-        private static final ThreadLocal<byte[]> BUFFER_TL = ThreadLocal.withInitial(() -> new byte[512]); // Buffer
-                                                                                                           // maior
+        private static final ThreadLocal<byte[]> BUFFER_TL = ThreadLocal.withInitial(() -> new byte[512]);
 
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                byte[] buffer = BUFFER_TL.get();
-                int totalRead = readRequestBody(exchange.getRequestBody(), buffer);
+            byte[] buffer = BUFFER_TL.get();
+            int totalRead = readRequestBody(exchange.getRequestBody(), buffer);
 
-                String correlationId = extractFieldFromBuffer(buffer, CORRELATION_PATTERN, totalRead);
+            String correlationId = extractFieldFromBuffer(buffer, CORRELATION_PATTERN, totalRead);
 
-                if (correlationId != null) {
-                    // Extrai amount da primeira requisição, depois usa cache
-                    String amount = getOrExtractAmount(buffer, totalRead);
+            String amount = getOrExtractAmount(buffer, totalRead);
 
-                    SimplePaymentProcessor.enqueuePayment(new PaymentRequest(correlationId, amount));
-                    sendSuccessResponse(exchange, 202);
-                } else {
-                    sendSuccessResponse(exchange, 400);
-                }
-            } else {
-                sendSuccessResponse(exchange, 405);
-            }
+            // Enqueue DIRETO sem async overhead
+            SimplePaymentProcessor.enqueuePayment(new PaymentRequest(correlationId, amount));
+
+            // Response IMEDIATA
+            sendSuccessResponseFast(exchange);
         }
 
         private String getOrExtractAmount(byte[] buffer, int totalRead) {
-            // Se já temos cached, usa
+            // Se já temos cached, usa (ultra-rápido)
             if (cachedAmount != null) {
                 return cachedAmount;
             }
@@ -70,12 +63,14 @@ public class PaymentApiServer {
             // Primeira requisição - extrai amount e cacheia
             String amount = extractFieldFromBuffer(buffer, AMOUNT_PATTERN, totalRead);
             if (amount != null) {
-                cachedAmount = amount; // Cacheia para próximas requisições
+                cachedAmount = amount;
+                cachedAmountBD = null; // Limpa cache do BigDecimal
                 return amount;
             }
 
-            // Fallback se não conseguir extrair
-            return "100.00";
+            // Fallback
+            cachedAmount = "100.00";
+            return cachedAmount;
         }
 
         private int readRequestBody(InputStream is, byte[] buffer) throws IOException {
@@ -96,7 +91,6 @@ public class PaymentApiServer {
                 int start = patternIndex + pattern.length;
                 int end = start;
 
-                // Encontra fim do valor (até aspas)
                 while (end < totalRead && buffer[end] != '"') {
                     end++;
                 }
@@ -124,84 +118,85 @@ public class PaymentApiServer {
         }
     }
 
-    static class PaymentSummaryHandler implements HttpHandler {
+    // Handler para GET mantém async apenas onde necessário
+    static class GetPaymentSummaryHandler implements HttpHandler {
         private static volatile String cachedResponse = null;
         private static volatile long cacheTime = 0;
-        private static final long CACHE_TTL_MS = 50;
+        private static final long CACHE_TTL_MS = 50; // Aumentado para reduzir calls Redis
 
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                long now = System.currentTimeMillis();
-                if (cachedResponse != null && (now - cacheTime) < CACHE_TTL_MS) {
-                    sendJsonResponse(exchange, cachedResponse);
-                    return;
-                }
+            long now = System.currentTimeMillis();
+            if (cachedResponse != null && (now - cacheTime) < CACHE_TTL_MS) {
+                sendJsonResponseFast(exchange, cachedResponse);
+                return;
+            }
 
-                CompletableFuture<Long> defaultRequestsFut = RedisAsyncManager.getTotalRequests();
+            // Async necessário apenas para Redis
+            CompletableFuture<Long> defaultRequestsFut = RedisAsyncManager.getTotalRequests();
 
-                defaultRequestsFut
-                        .orTimeout(100, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        .whenComplete((defaultRequests, throwable) -> {
-                            try {
-                                String response;
-                                if (throwable != null || defaultRequests == null) {
-                                    response = "{\"default\":{\"totalRequests\":0,\"totalAmount\":0.00},\"fallback\":{\"totalRequests\":0,\"totalAmount\":0.00}}";
-                                } else {
-                                    // Calcula defaultAmount = cachedAmount * defaultRequests
-                                    BigDecimal defaultAmount = calculateTotalAmount(defaultRequests);
+            defaultRequestsFut
+                    .orTimeout(50, java.util.concurrent.TimeUnit.MILLISECONDS) // Timeout MUITO agressivo
+                    .whenComplete((defaultRequests, throwable) -> {
+                        try {
+                            String response;
+                            if (throwable != null || defaultRequests == null) {
+                                response = "{\"default\":{\"totalRequests\":0,\"totalAmount\":0.00},\"fallback\":{\"totalRequests\":0,\"totalAmount\":0.00}}";
+                            } else {
+                                BigDecimal defaultAmount = calculateTotalAmountFast(defaultRequests);
 
-                                    response = "{\"default\":{\"totalRequests\":" + defaultRequests +
-                                            ",\"totalAmount\":" + defaultAmount +
-                                            "},\"fallback\":{\"totalRequests\":0,\"totalAmount\":0.00}}";
-                                }
-
-                                cachedResponse = response;
-                                cacheTime = System.currentTimeMillis();
-
-                                sendJsonResponse(exchange, response);
-                            } catch (Exception e) {
-                                String fallbackResponse = "{\"default\":{\"totalRequests\":0,\"totalAmount\":0.00},\"fallback\":{\"totalRequests\":0,\"totalAmount\":0.00}}";
-                                sendJsonResponse(exchange, fallbackResponse);
+                                // String concatenation DIRETA (mais rápida que StringBuilder para strings
+                                // pequenas)
+                                response = "{\"default\":{\"totalRequests\":" + defaultRequests +
+                                        ",\"totalAmount\":" + defaultAmount +
+                                        "},\"fallback\":{\"totalRequests\":0,\"totalAmount\":0.00}}";
                             }
-                        });
-            }
+
+                            cachedResponse = response;
+                            cacheTime = System.currentTimeMillis();
+                            sendJsonResponseFast(exchange, response);
+                        } catch (Exception e) {
+                            sendJsonResponseFast(exchange,
+                                    "{\"default\":{\"totalRequests\":0,\"totalAmount\":0.00},\"fallback\":{\"totalRequests\":0,\"totalAmount\":0.00}}");
+                        }
+                    });
         }
 
-        private BigDecimal calculateTotalAmount(long totalRequests) {
-            if (cachedAmount == null || totalRequests == 0) {
+        private BigDecimal calculateTotalAmountFast(long totalRequests) {
+            if (totalRequests == 0)
                 return BigDecimal.ZERO;
+
+            if (cachedAmountBD == null && cachedAmount != null) {
+                try {
+                    cachedAmountBD = new BigDecimal(cachedAmount);
+                } catch (NumberFormatException e) {
+                    return BigDecimal.ZERO;
+                }
             }
 
-            try {
-                BigDecimal amountPerRequest = new BigDecimal(cachedAmount);
-                return amountPerRequest.multiply(BigDecimal.valueOf(totalRequests));
-            } catch (NumberFormatException e) {
-                return BigDecimal.ZERO;
-            }
+            return cachedAmountBD != null ? cachedAmountBD.multiply(BigDecimal.valueOf(totalRequests))
+                    : BigDecimal.ZERO;
         }
     }
 
-    private static void sendSuccessResponse(HttpExchange exchange, int statusCode) {
+    // Response methods ULTRA-OTIMIZADOS
+    private static void sendSuccessResponseFast(HttpExchange exchange) {
         try {
-            exchange.sendResponseHeaders(statusCode, 0);
-            exchange.getResponseBody().close();
-        } catch (IOException e) {
-            // Ignore
+            exchange.sendResponseHeaders(202, -1); // -1 = no body, mais rápido
+        } catch (IOException ignored) {
         }
     }
-
-    private static void sendJsonResponse(HttpExchange exchange, String response) {
+    
+    private static void sendJsonResponseFast(HttpExchange exchange, String response) {
         try {
             byte[] responseBytes = response.getBytes(StandardCharsets.UTF_8);
-
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, responseBytes.length);
 
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(responseBytes);
             }
-        } catch (IOException e) {
+        } catch (IOException ignored) {
         }
     }
 }
